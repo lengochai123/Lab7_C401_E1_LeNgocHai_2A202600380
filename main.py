@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import sys
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from src.agent import KnowledgeBaseAgent
+from src.chunking import SentenceChunker
 from src.embeddings import (
     EMBEDDING_PROVIDER_ENV,
     LOCAL_EMBEDDING_MODEL,
@@ -18,14 +20,41 @@ from src.embeddings import (
 from src.models import Document
 from src.store import EmbeddingStore
 
-SAMPLE_FILES = [
-    "data/python_intro.txt",
-    "data/vector_store_notes.md",
-    "data/rag_system_design.md",
-    "data/customer_support_playbook.txt",
-    "data/chunking_experiment_report.md",
-    "data/vi_retrieval_notes.md",
-]
+# Configure stdout for UTF-8 to handle Vietnamese characters
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+
+def get_sample_files(data_dir: str = "data") -> list[str]:
+    """Dynamically load all .md and .txt files from specified directory.
+    
+    Prefers .md over .txt if both versions exist (e.g., python_intro.md vs python_intro.txt).
+    """
+    dir_path = Path(data_dir)
+    if not dir_path.exists():
+        return []
+    
+    # Group files by stem (name without extension)
+    files_by_stem: dict[str, list[Path]] = {}
+    for file_path in dir_path.glob("*"):
+        if file_path.is_file() and file_path.suffix.lower() in {".md", ".txt"}:
+            stem = file_path.stem
+            if stem not in files_by_stem:
+                files_by_stem[stem] = []
+            files_by_stem[stem].append(file_path)
+    
+    # Prefer .md over .txt if both exist
+    result = []
+    for stem in sorted(files_by_stem.keys()):
+        candidates = files_by_stem[stem]
+        # Sort to prefer .md
+        candidates.sort(key=lambda p: (p.suffix.lower() != ".md", str(p)))
+        result.append(str(candidates[0]))
+    
+    return result
+
+
+SAMPLE_FILES = get_sample_files()
 
 
 def load_documents_from_files(file_paths: list[str]) -> list[Document]:
@@ -58,6 +87,29 @@ def load_documents_from_files(file_paths: list[str]) -> list[Document]:
 
 def demo_llm(prompt: str) -> str:
     """A simple mock LLM for manual RAG testing."""
+    import re
+
+    query = prompt.split("Question:", 1)[-1].strip()
+    # Tìm pattern (YYYY–YYYY) hoặc (YYYY-YYYY) hoặc (YYYY — YYYY)
+    range_match = re.search(r"\((1[0-9]{3}|20[0-9]{2})\s*[–-—-]\s*(1[0-9]{3}|20[0-9]{2})\)", prompt)
+    q_lower = query.lower()
+    if any(k in q_lower for k in ["sinh năm", "năm sinh", "sinh vào năm"]):
+        if range_match:
+            return f"[DEMO LLM] Sinh năm {range_match.group(1)}."
+        year_matches = re.findall(r"\b(1[0-9]{3}|20[0-9]{2})\b", prompt)
+        if year_matches:
+            return f"[DEMO LLM] Sinh năm {year_matches[0]}."
+        return "[DEMO LLM] Không tìm thấy năm sinh trong ngữ cảnh."
+    if any(k in q_lower for k in ["mất năm", "năm mất", "mất vào năm"]):
+        if range_match:
+            return f"[DEMO LLM] Mất năm {range_match.group(2)}."
+        year_matches = re.findall(r"\b(1[0-9]{3}|20[0-9]{2})\b", prompt)
+        if len(year_matches) > 1:
+            return f"[DEMO LLM] Mất năm {year_matches[1]}."
+        elif year_matches:
+            return f"[DEMO LLM] Mất năm {year_matches[0]}."
+        return "[DEMO LLM] Không tìm thấy năm mất trong ngữ cảnh."
+
     preview = prompt[:400].replace("\n", " ")
     return f"[DEMO LLM] Generated answer from prompt preview: {preview}..."
 
@@ -101,9 +153,25 @@ def run_manual_demo(question: str | None = None, sample_files: list[str] | None 
     print(f"\nEmbedding backend: {getattr(embedder, '_backend_name', embedder.__class__.__name__)}")
 
     store = EmbeddingStore(collection_name="manual_test_store", embedding_fn=embedder)
-    store.add_documents(docs)
 
-    print(f"\nStored {store.get_collection_size()} documents in EmbeddingStore")
+    # Áp dụng SentenceChunker: chunk mỗi document thành các đoạn nhỏ
+    chunker = SentenceChunker(max_sentences_per_chunk=3)
+    chunked_docs: list[Document] = []
+    for doc in docs:
+        chunks = chunker.chunk(doc.content)
+        for i, chunk_text in enumerate(chunks):
+            chunked_docs.append(
+                Document(
+                    id=f"{doc.id}_chunk_{i}",
+                    content=chunk_text,
+                    metadata={**doc.metadata, "doc_id": doc.id, "chunk_index": i},
+                )
+            )
+    print(f"\nChunked {len(docs)} documents → {len(chunked_docs)} chunks (SentenceChunker, 3 sentences/chunk)")
+
+    store.add_documents(chunked_docs)
+
+    print(f"Stored {store.get_collection_size()} chunks in EmbeddingStore")
     print("\n=== EmbeddingStore Search Test ===")
     print(f"Query: {query}")
     search_results = store.search(query, top_k=3)
@@ -120,8 +188,20 @@ def run_manual_demo(question: str | None = None, sample_files: list[str] | None 
 
 
 def main() -> int:
-    question = " ".join(sys.argv[1:]).strip() if len(sys.argv) > 1 else None
-    return run_manual_demo(question=question)
+    args = sys.argv[1:]
+    
+    # Check for --docs flag to load from data/docs
+    use_docs_folder = "--docs" in args
+    if use_docs_folder:
+        args = [arg for arg in args if arg != "--docs"]
+    
+    question = " ".join(args).strip() if args else None
+    
+    # Determine which directory to use
+    data_dir = "data/docs" if use_docs_folder else "data"
+    sample_files = get_sample_files(data_dir)
+    
+    return run_manual_demo(question=question, sample_files=sample_files)
 
 
 if __name__ == "__main__":
